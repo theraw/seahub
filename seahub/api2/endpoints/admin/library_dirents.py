@@ -18,7 +18,8 @@ from seahub.utils.timeutils import timestamp_to_isoformat_timestr
 from seahub.views.sysadmin import can_view_sys_admin_repo
 from seahub.views.file import send_file_access_msg
 from seahub.utils import is_org_context, gen_file_get_url, \
-    check_filename_with_rename, is_valid_dirent_name
+    check_filename_with_rename, is_valid_dirent_name, \
+    normalize_dir_path
 from seahub.views import get_system_default_repo_id
 
 from seahub.api2.authentication import TokenAuthentication
@@ -208,6 +209,77 @@ class AdminLibraryDirent(APIView):
         dirent_info = get_dirent_info(dirent)
 
         return Response(dirent_info)
+
+    def put(self, request, repo_id):
+        """ Copy a single file/folder to other place.
+        """
+
+        # check parameter for src
+        repo = seafile_api.get_repo(repo_id)
+        if not repo:
+            error_msg = 'Library %s not found.' % repo_id
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        if not can_view_sys_admin_repo(repo):
+            error_msg = 'Feature disabled.'
+            return api_error(status.HTTP_403_FORBIDDEN, error_msg)
+
+        path = request.GET.get('path', None)
+        if not path:
+            error_msg = 'path invalid.'
+            return api_error(status.HTTP_400_BAD_REQUEST, error_msg)
+
+        try:
+            dirent = seafile_api.get_dirent_by_path(repo_id, path)
+        except Exception as e:
+            logger.error(e)
+            error_msg = 'Internal Server Error'
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+
+        if not dirent:
+            error_msg = 'File or folder %s not found.' % path
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        if path == '/':
+            error_msg = 'path invalid.'
+            return api_error(status.HTTP_400_BAD_REQUEST, error_msg)
+
+        # first normalize path to '/1/2/3/' format
+        path = normalize_dir_path(path)
+        # then to '/1/2/3' format
+        path = path.rstrip('/')
+
+        # now get `src_dir` and `obj_name` according to normalized path
+        src_repo_id = repo_id
+        src_dir = os.path.dirname(path)
+        src_obj_name = os.path.basename(path)
+
+        # check parameter for dst
+        dst_repo_id = request.data.get('dst_repo_id', src_repo_id)
+        if dst_repo_id != src_repo_id and not seafile_api.get_repo(dst_repo_id):
+            error_msg = 'Library %s not found.' % dst_repo_id
+            return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        dst_dir = request.data.get('dst_dir', '/')
+        if dst_dir != '/':
+            dst_dir = normalize_dir_path(dst_dir)
+            if not seafile_api.get_dir_id_by_path(dst_repo_id, dst_dir):
+                error_msg = 'Folder %s not found.' % dst_dir
+                return api_error(status.HTTP_404_NOT_FOUND, error_msg)
+
+        # copy file
+        username = request.user.username
+        dst_obj_name = check_filename_with_rename(dst_repo_id, dst_dir,
+                src_obj_name)
+        try:
+            seafile_api.copy_file(src_repo_id, src_dir, src_obj_name, dst_repo_id,
+                      dst_dir, dst_obj_name, username, need_progress=0, synchronous=1)
+        except SearpcError as e:
+            logger.error(e)
+            error_msg = 'Internal Server Error'
+            return api_error(status.HTTP_500_INTERNAL_SERVER_ERROR, error_msg)
+
+        return Response({'success': True})
 
     def delete(self, request, repo_id):
         """ delete a single file/folder in a library
